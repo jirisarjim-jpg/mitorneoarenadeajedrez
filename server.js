@@ -6,30 +6,33 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
-// Almacén de torneos activos (cada clave de acceso es un torneo distinto)
 let tournaments = {}; 
 
-// Bucle de emparejamiento cada 3 segundos para TODOS los torneos activos
+// Bucle de emparejamiento y control de tiempo global cada 2 segundos
 setInterval(() => {
   const now = Date.now();
 
   for (const code in tournaments) {
     const t = tournaments[code];
     
-    // Comprobar si el tiempo global del torneo ya terminó
+    // --- COMPROBAR FIN DEL TORNEO ---
     if (t.active && t.endTime && now >= t.endTime) {
       t.active = false;
-      io.to(`lobby_${code}`).emit('tournament-ended');
+      t.finished = true;
+      t.activeMatches = {}; // Las partidas en juego se cancelan y no suman puntos
+
+      // Calcular clasificación definitiva
+      const standings = getSortedStandings(t);
+      io.to(`lobby_${code}`).emit('tournament-ended', { standings });
       continue;
     }
 
     if (!t.active) continue;
 
-    // Filtrar jugadores que están esperando rival en este torneo
+    // Filtrar jugadores esperando rival
     let waitingPlayers = Object.values(t.players).filter(p => p.status === 'waiting');
     if (waitingPlayers.length < 2) continue;
 
-    // Mezclar aleatoriamente para variar emparejamientos
     waitingPlayers.sort(() => Math.random() - 0.5);
 
     for (let i = 0; i < waitingPlayers.length; i++) {
@@ -42,21 +45,19 @@ setInterval(() => {
         let maxWaitTime = Math.max(now - p1.joinedQueueAt, now - p2.joinedQueueAt);
         let isConsecutive = (p1.lastOpponent === p2.id) || (p2.lastOpponent === p1.id);
 
-        // Regla anti-repetición: evitar mismo rival salvo 5 min de espera o si son los únicos 2
         if (isConsecutive) {
           let waited5Min = maxWaitTime >= 300000;
-          let onlyTwoLeft = (waitingPlayers.length === 2 && maxWaitTime >= 15000); // 15s si no hay nadie más
+          let onlyTwoLeft = (waitingPlayers.length === 2 && maxWaitTime >= 15000);
           if (!waited5Min && !onlyTwoLeft) continue;
         }
 
-        // ¡Emparejar!
         const roomId = `match_${code}_${p1.id}_${p2.id}_${now}`;
         p1.status = 'playing';
         p2.status = 'playing';
         p1.lastOpponent = p2.id;
         p2.lastOpponent = p1.id;
 
-        t.activeMatches[roomId] = { w: p1.name, b: p2.name, wId: p1.id, bId: p2.id };
+        t.activeMatches[roomId] = { w: p1.name, b: p2.name, wId: p1.id, bId: p2.id, scored: false };
 
         const s1 = io.sockets.sockets.get(p1.id);
         const s2 = io.sockets.sockets.get(p2.id);
@@ -74,15 +75,31 @@ setInterval(() => {
       }
     }
   }
-}, 3000);
+}, 2000);
+
+function getSortedStandings(t) {
+  return Object.values(t.players)
+    .map(p => ({
+      id: p.id,
+      name: p.name,
+      score: p.score,
+      wins: p.wins,
+      draws: p.draws,
+      losses: p.losses,
+      status: p.status,
+      isHost: p.id === t.hostId
+    }))
+    .sort((a, b) => b.score - a.score || b.wins - a.wins);
+}
 
 function broadcastTournamentState(code) {
   const t = tournaments[code];
   if (!t) return;
   io.to(`lobby_${code}`).emit('tournament-update', {
-    players: Object.values(t.players).map(p => ({ id: p.id, name: p.name, status: p.status, isHost: p.id === t.hostId })),
+    standings: getSortedStandings(t),
     activeMatches: Object.values(t.activeMatches),
     active: t.active,
+    finished: t.finished,
     endTime: t.endTime,
     matchTime: t.matchTime
   });
@@ -90,7 +107,6 @@ function broadcastTournamentState(code) {
 
 io.on('connection', (socket) => {
   
-  // 1. CREAR TORNEO ARENA
   socket.on('create-tournament', ({ code, hostName, durationMinutes, matchTimeMinutes }) => {
     const cleanCode = code.trim().toUpperCase();
     if (tournaments[cleanCode]) {
@@ -103,18 +119,19 @@ io.on('connection', (socket) => {
       duration: parseInt(durationMinutes),
       matchTime: parseInt(matchTimeMinutes),
       active: false,
+      finished: false,
       endTime: null,
       players: {},
       activeMatches: {}
     };
 
-    // Unir al creador al torneo
     tournaments[cleanCode].players[socket.id] = {
       id: socket.id,
       name: hostName || 'Organizador',
       status: 'lobby',
       lastOpponent: null,
-      joinedQueueAt: 0
+      joinedQueueAt: 0,
+      score: 0, wins: 0, draws: 0, losses: 0
     };
 
     socket.tournamentCode = cleanCode;
@@ -123,20 +140,19 @@ io.on('connection', (socket) => {
     broadcastTournamentState(cleanCode);
   });
 
-  // 2. UNIRSE A TORNEO CON CLAVE
   socket.on('join-tournament', ({ code, playerName }) => {
     const cleanCode = code.trim().toUpperCase();
     const t = tournaments[cleanCode];
-    if (!t) {
-      return socket.emit('error-msg', 'No existe ningún torneo con esa clave.');
-    }
+    if (!t) return socket.emit('error-msg', 'No existe ningún torneo con esa clave.');
+    if (t.finished) return socket.emit('error-msg', 'Este torneo ya ha terminado.');
 
     t.players[socket.id] = {
       id: socket.id,
       name: playerName || 'Jugador',
       status: t.active ? 'waiting' : 'lobby',
       lastOpponent: null,
-      joinedQueueAt: Date.now()
+      joinedQueueAt: Date.now(),
+      score: 0, wins: 0, draws: 0, losses: 0
     };
 
     socket.tournamentCode = cleanCode;
@@ -145,7 +161,6 @@ io.on('connection', (socket) => {
     broadcastTournamentState(cleanCode);
   });
 
-  // 3. ARRANCAR EL TORNEO (SOLO ORGANIZADOR)
   socket.on('start-tournament', (code) => {
     const t = tournaments[code];
     if (!t || t.hostId !== socket.id) return;
@@ -153,7 +168,6 @@ io.on('connection', (socket) => {
     t.active = true;
     t.endTime = Date.now() + (t.duration * 60000);
     
-    // Poner a todos en cola de búsqueda
     for (const id in t.players) {
       t.players[id].status = 'waiting';
       t.players[id].joinedQueueAt = Date.now();
@@ -162,7 +176,33 @@ io.on('connection', (socket) => {
     broadcastTournamentState(code);
   });
 
-  // 4. VOLVER A LA COLA TRAS ACABAR PARTIDA
+  // --- REGISTRO OFICIAL DE PUNTOS ---
+  socket.on('report-result', ({ code, room, result }) => {
+    const t = tournaments[code];
+    // Si el torneo ya terminó, las partidas en curso NO puntúan
+    if (!t || !t.active || t.finished) return;
+
+    const match = t.activeMatches[room];
+    if (!match || match.scored) return; // Evita duplicar puntos si ambos clientes reportan
+
+    match.scored = true;
+    const pW = t.players[match.wId];
+    const pB = t.players[match.bId];
+
+    if (result === 'w') {
+      if (pW) { pW.score += 2; pW.wins += 1; }
+      if (pB) { pB.losses += 1; }
+    } else if (result === 'b') {
+      if (pB) { pB.score += 2; pB.wins += 1; }
+      if (pW) { pW.losses += 1; }
+    } else if (result === 'draw') {
+      if (pW) { pW.score += 1; pW.draws += 1; }
+      if (pB) { pB.score += 1; pB.draws += 1; }
+    }
+
+    broadcastTournamentState(code);
+  });
+
   socket.on('return-to-arena', ({ code, room }) => {
     const t = tournaments[code];
     if (!t) return;
@@ -178,21 +218,18 @@ io.on('connection', (socket) => {
     broadcastTournamentState(code);
   });
 
-  // 5. RETRANSMISIÓN DE JUGADAS
   socket.on('make-move', (data) => socket.to(data.room).emit('move-received', data));
   socket.on('resign', (room) => socket.to(room).emit('resign'));
   socket.on('timeout', (data) => socket.to(data.room).emit('timeout', data));
   socket.on('draw-offer', (room) => socket.to(room).emit('draw-offer'));
   socket.on('draw-agreed', (room) => socket.to(room).emit('draw-agreed'));
 
-  // DESCONEXIÓN
   socket.on('disconnecting', () => {
     const code = socket.tournamentCode;
     if (code && tournaments[code]) {
       const t = tournaments[code];
       delete t.players[socket.id];
       
-      // Limpiar partidas donde estuviera este jugador
       for (const room in t.activeMatches) {
         if (t.activeMatches[room].wId === socket.id || t.activeMatches[room].bId === socket.id) {
           delete t.activeMatches[room];
@@ -205,4 +242,4 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Servidor Arena corriendo en puerto ${PORT}`));
+server.listen(PORT, () => console.log(`Servidor Arena con Clasificación corriendo en puerto ${PORT}`));
